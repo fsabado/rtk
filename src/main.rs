@@ -44,6 +44,8 @@ pub enum AgentTarget {
     Kilocode,
     /// Google Antigravity
     Antigravity,
+    /// Pi coding agent
+    Pi,
 }
 
 #[derive(Parser)]
@@ -371,6 +373,10 @@ enum Commands {
         /// Install GitHub Copilot integration (VS Code + CLI)
         #[arg(long)]
         copilot: bool,
+
+        /// Install Pi coding agent extension
+        #[arg(long)]
+        pi: bool,
     },
 
     /// Download with compact output (strips progress bars)
@@ -1754,62 +1760,108 @@ fn run_cli() -> Result<i32> {
             uninstall,
             codex,
             copilot,
+            pi,
         } => {
             if show {
                 hooks::init::show_config(codex)?;
             } else if uninstall {
                 let cursor = agent == Some(AgentTarget::Cursor);
-                hooks::init::uninstall(global, gemini, codex, cursor, cli.verbose)?;
-            } else if gemini {
-                let patch_mode = if auto_patch {
-                    hooks::init::PatchMode::Auto
-                } else if no_patch {
-                    hooks::init::PatchMode::Skip
-                } else {
-                    hooks::init::PatchMode::Ask
-                };
-                hooks::init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
-            } else if copilot {
-                hooks::init::run_copilot(cli.verbose)?;
-            } else if agent == Some(AgentTarget::Kilocode) {
-                if global {
-                    anyhow::bail!("Kilo Code is project-scoped. Use: rtk init --agent kilocode");
-                }
-                hooks::init::run_kilocode_mode(cli.verbose)?;
-            } else if agent == Some(AgentTarget::Antigravity) {
-                if global {
+                let uninstall_pi = pi || agent == Some(AgentTarget::Pi);
+                hooks::init::uninstall(global, gemini, codex, cursor, uninstall_pi, cli.verbose)?;
+            } else {
+                // Guard: --pi only composes with the default Claude/OpenCode flow.
+                // Combining it with a dedicated-agent mode silently swallows
+                // one of the two installs, so we fail loudly with clear guidance.
+                if pi && gemini {
                     anyhow::bail!(
-                        "Antigravity is project-scoped. Use: rtk init --agent antigravity"
+                        "--pi cannot be combined with --gemini. Run them separately:\n  rtk init --pi\n  rtk init --gemini"
                     );
                 }
-                hooks::init::run_antigravity_mode(cli.verbose)?;
-            } else {
-                let install_opencode = opencode;
-                let install_claude = !opencode;
-                let install_cursor = agent == Some(AgentTarget::Cursor);
-                let install_windsurf = agent == Some(AgentTarget::Windsurf);
-                let install_cline = agent == Some(AgentTarget::Cline);
+                if pi && copilot {
+                    anyhow::bail!(
+                        "--pi cannot be combined with --copilot. Run them separately:\n  rtk init --pi\n  rtk init --copilot"
+                    );
+                }
+                if pi && codex {
+                    anyhow::bail!(
+                        "--pi cannot be combined with --codex. Run them separately:\n  rtk init --pi\n  rtk init --codex"
+                    );
+                }
+                if pi && matches!(agent, Some(AgentTarget::Kilocode)) {
+                    anyhow::bail!(
+                        "--pi cannot be combined with --agent kilocode. Run them separately:\n  rtk init --pi\n  rtk init --agent kilocode"
+                    );
+                }
+                if pi && matches!(agent, Some(AgentTarget::Antigravity)) {
+                    anyhow::bail!(
+                        "--pi cannot be combined with --agent antigravity. Run them separately:\n  rtk init --pi\n  rtk init --agent antigravity"
+                    );
+                }
 
-                let patch_mode = if auto_patch {
-                    hooks::init::PatchMode::Auto
-                } else if no_patch {
-                    hooks::init::PatchMode::Skip
+                if gemini {
+                    let patch_mode = if auto_patch {
+                        hooks::init::PatchMode::Auto
+                    } else if no_patch {
+                        hooks::init::PatchMode::Skip
+                    } else {
+                        hooks::init::PatchMode::Ask
+                    };
+                    hooks::init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
+                } else if copilot {
+                    hooks::init::run_copilot(cli.verbose)?;
+                } else if agent == Some(AgentTarget::Pi) {
+                    // Pi-only mode: --agent pi installs Pi and nothing else.
+                    hooks::init::run_pi_mode(global, cli.verbose)?;
+                } else if agent == Some(AgentTarget::Kilocode) {
+                    if global {
+                        anyhow::bail!(
+                            "Kilo Code is project-scoped. Use: rtk init --agent kilocode"
+                        );
+                    }
+                    hooks::init::run_kilocode_mode(cli.verbose)?;
+                } else if agent == Some(AgentTarget::Antigravity) {
+                    if global {
+                        anyhow::bail!(
+                            "Antigravity is project-scoped. Use: rtk init --agent antigravity"
+                        );
+                    }
+                    hooks::init::run_antigravity_mode(cli.verbose)?;
                 } else {
-                    hooks::init::PatchMode::Ask
-                };
-                hooks::init::run(
-                    global,
-                    install_claude,
-                    install_opencode,
-                    install_cursor,
-                    install_windsurf,
-                    install_cline,
-                    claude_md,
-                    hook_only,
-                    codex,
-                    patch_mode,
-                    cli.verbose,
-                )?;
+                    let install_opencode = opencode;
+                    let install_claude = !opencode;
+                    let install_cursor = agent == Some(AgentTarget::Cursor);
+                    let install_windsurf = agent == Some(AgentTarget::Windsurf);
+                    let install_cline = agent == Some(AgentTarget::Cline);
+
+                    let patch_mode = if auto_patch {
+                        hooks::init::PatchMode::Auto
+                    } else if no_patch {
+                        hooks::init::PatchMode::Skip
+                    } else {
+                        hooks::init::PatchMode::Ask
+                    };
+
+                    // Run the main Claude/OpenCode flow first so validation
+                    // failures don't leave a partial Pi install behind.
+                    hooks::init::run(
+                        global,
+                        install_claude,
+                        install_opencode,
+                        install_cursor,
+                        install_windsurf,
+                        install_cline,
+                        claude_md,
+                        hook_only,
+                        codex,
+                        patch_mode,
+                        cli.verbose,
+                    )?;
+
+                    // --pi is additive: layer Pi extension on top of the main flow.
+                    if pi {
+                        hooks::init::run_pi_mode(global, cli.verbose)?;
+                    }
+                }
             }
             0
         }
