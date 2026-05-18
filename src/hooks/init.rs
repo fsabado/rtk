@@ -654,16 +654,26 @@ pub fn uninstall(
         let mut removed: Vec<String> = Vec::new();
 
         if plugin_path.exists() {
-            fs::remove_file(&plugin_path).with_context(|| {
-                format!("Failed to remove Pi extension: {}", plugin_path.display())
-            })?;
-            if verbose > 0 {
-                eprintln!("Removed Pi extension: {}", plugin_path.display());
+            if dry_run {
+                println!(
+                    "[dry-run] would remove Pi extension: {}",
+                    plugin_path.display()
+                );
+            } else {
+                // nosemgrep: filesystem-deletion -- Pi uninstall removes only the RTK-managed extension file.
+                fs::remove_file(&plugin_path).with_context(|| {
+                    format!("Failed to remove Pi extension: {}", plugin_path.display())
+                })?;
+                if verbose > 0 {
+                    eprintln!("Removed Pi extension: {}", plugin_path.display());
+                }
+                removed.push(format!("Pi extension: {}", plugin_path.display()));
             }
-            removed.push(format!("Pi extension: {}", plugin_path.display()));
         }
 
-        if !removed.is_empty() {
+        if dry_run {
+            print_dry_run_footer();
+        } else if !removed.is_empty() {
             println!("RTK uninstalled (Pi):");
             for item in &removed {
                 println!("  - {}", item);
@@ -2788,39 +2798,52 @@ fn ensure_pi_plugin_installed(path: &Path, ctx: InitContext) -> Result<bool> {
     write_if_changed(path, PI_PLUGIN, "Pi extension", ctx)
 }
 
+/// Create the Pi extensions directory, or in dry-run mode, print a message only if
+/// the directory does not yet exist (avoids reporting no-op changes).
+fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    if dry_run {
+        if !parent.exists() {
+            println!("[dry-run] would create {}: {}", name, parent.display());
+        }
+    } else {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}: {}", name, parent.display()))?;
+    }
+    Ok(())
+}
+
 /// Install the Pi extension (hook-only; no AGENTS.md injection).
 ///
 /// global=true  → `$PI_CODING_AGENT_DIR/extensions/rtk.ts`
 /// global=false → `.pi/extensions/rtk.ts`
 pub fn run_pi_mode(global: bool, ctx: InitContext) -> Result<()> {
-    let InitContext { verbose: _, .. } = ctx;
+    let InitContext {
+        verbose: _,
+        dry_run,
+    } = ctx;
     let plugin_path = if global {
         let pi_dir = resolve_pi_dir()?;
         let path = pi_plugin_path(&pi_dir);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create Pi extensions directory: {}",
-                    parent.display()
-                )
-            })?;
+            ensure_pi_extensions_dir(parent, "Pi extensions directory", ctx)?;
         }
         path
     } else {
         let path = pi_plugin_path_for_scope(false)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create local Pi extensions directory: {}",
-                    parent.display()
-                )
-            })?;
+            ensure_pi_extensions_dir(parent, "local Pi extensions directory", ctx)?;
         }
         path
     };
 
     let installed = ensure_pi_plugin_installed(&plugin_path, ctx)?;
-    print_pi_result(&plugin_path, installed);
+
+    if dry_run {
+        print_dry_run_footer();
+    } else {
+        print_pi_result(&plugin_path, installed);
+    }
 
     Ok(())
 }
@@ -5897,6 +5920,125 @@ mod tests {
             PathBuf::from(".pi")
                 .join(PI_EXTENSIONS_SUBDIR)
                 .join(PI_PLUGIN_FILE)
+        );
+    }
+
+    #[test]
+    fn test_run_pi_mode_global_dry_run_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        with_pi_dir_override(&tmp, |pi_dir| {
+            run_pi_mode(
+                true,
+                InitContext {
+                    verbose: 0,
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+
+            assert!(
+                !pi_dir.join(PI_EXTENSIONS_SUBDIR).exists(),
+                "dry-run must not create the Pi extensions directory"
+            );
+            assert!(
+                !pi_dir
+                    .join(PI_EXTENSIONS_SUBDIR)
+                    .join(PI_PLUGIN_FILE)
+                    .exists(),
+                "dry-run must not create the Pi extension file"
+            );
+        });
+    }
+
+    #[test]
+    fn test_run_pi_mode_local_dry_run_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = run_pi_mode(
+            false,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(
+            !tmp.path().join(".pi").join(PI_EXTENSIONS_SUBDIR).exists(),
+            "dry-run must not create .pi/extensions/"
+        );
+    }
+
+    #[test]
+    fn test_pi_global_uninstall_dry_run_keeps_plugin() {
+        let tmp = TempDir::new().unwrap();
+        with_pi_dir_override(&tmp, |pi_dir| {
+            run_pi_mode(true, InitContext::default()).unwrap();
+            let plugin = pi_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
+            assert!(
+                plugin.exists(),
+                "plugin must exist before uninstall dry-run"
+            );
+
+            uninstall(
+                true,
+                false,
+                false,
+                false,
+                true,
+                InitContext {
+                    verbose: 0,
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+
+            assert!(
+                plugin.exists(),
+                "dry-run uninstall must not remove the Pi extension"
+            );
+        });
+    }
+
+    #[test]
+    fn test_pi_local_uninstall_dry_run_keeps_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_pi_mode(false, InitContext::default()).unwrap();
+        let plugin = tmp
+            .path()
+            .join(".pi")
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(
+            plugin.exists(),
+            "plugin must exist before uninstall dry-run"
+        );
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(
+            plugin.exists(),
+            "dry-run uninstall must not remove the local Pi extension"
         );
     }
 }

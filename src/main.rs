@@ -1799,7 +1799,7 @@ fn run_cli() -> Result<i32> {
                 dry_run,
             };
             if show {
-                hooks::init::show_config(codex)?
+                hooks::init::show_config(codex)?;
             } else if uninstall {
                 uninstall_init_dispatch(
                     agent,
