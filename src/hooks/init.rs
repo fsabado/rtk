@@ -4050,6 +4050,15 @@ fn run_copilot_global_at(copilot_dir: &Path, ctx: InitContext) -> Result<()> {
             .with_context(|| format!("Failed to create {} directory", hooks_dir.display()))?;
     }
 
+    let instructions_path = copilot_dir.join(COPILOT_INSTRUCTIONS_FILE);
+    write_rtk_block(
+        &instructions_path,
+        COPILOT_INSTRUCTIONS,
+        "Copilot user-level instructions",
+        "rtk init --global --copilot",
+        ctx,
+    )?;
+
     let hook_path = hooks_dir.join(COPILOT_HOOK_FILE);
     write_if_changed(
         &hook_path,
@@ -4063,6 +4072,7 @@ fn run_copilot_global_at(copilot_dir: &Path, ctx: InitContext) -> Result<()> {
     } else {
         println!("\nGitHub Copilot global integration installed (user-scoped).\n");
         println!("  Hook config:    {}", hook_path.display());
+        println!("  Instructions:   {}", instructions_path.display());
         println!("\n  Applies to all Copilot CLI sessions on this machine.");
         println!("  Restart your Copilot CLI session to activate.\n");
     }
@@ -4115,6 +4125,31 @@ fn uninstall_copilot_global_at(copilot_dir: &Path, ctx: InitContext) -> Result<V
                 .with_context(|| format!("Failed to remove hook: {}", hook_path.display()))?;
         }
         removed.push(format!("Hook config: {}", hook_path.display()));
+    }
+
+    let instructions_path = copilot_dir.join(COPILOT_INSTRUCTIONS_FILE);
+    if instructions_path.exists() {
+        let content = fs::read_to_string(&instructions_path)
+            .with_context(|| format!("Failed to read {}", instructions_path.display()))?;
+        if content.contains(RTK_BLOCK_START) {
+            let (cleaned, did_remove) = remove_rtk_block(&content);
+            if did_remove {
+                if dry_run {
+                    println!(
+                        "[dry-run] would remove rtk-instructions block from {}",
+                        instructions_path.display()
+                    );
+                } else {
+                    atomic_write(&instructions_path, &cleaned).with_context(|| {
+                        format!("Failed to write {}", instructions_path.display())
+                    })?;
+                }
+                removed.push(format!(
+                    "{}: removed rtk-instructions block",
+                    COPILOT_INSTRUCTIONS_FILE
+                ));
+            }
+        }
     }
 
     Ok(removed)
@@ -6600,13 +6635,41 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_global_install_does_not_write_instructions() {
+    fn test_copilot_global_install_writes_instructions() {
         let temp = TempDir::new().unwrap();
         run_copilot_global_at(temp.path(), InitContext::default()).unwrap();
-        assert!(
-            !temp.path().join(COPILOT_INSTRUCTIONS_FILE).exists(),
-            "global install must not create a user-level instructions file (undocumented path)"
-        );
+        let instructions = temp.path().join(COPILOT_INSTRUCTIONS_FILE);
+        assert!(instructions.exists(), "user-level instructions must be written");
+        let content = fs::read_to_string(&instructions).unwrap();
+        assert!(content.contains(RTK_BLOCK_START));
+        assert!(content.contains("rtk cargo test"));
+    }
+
+    #[test]
+    fn test_copilot_global_install_preserves_existing_user_instructions() {
+        let temp = TempDir::new().unwrap();
+        let instructions = temp.path().join(COPILOT_INSTRUCTIONS_FILE);
+        fs::write(&instructions, "# My rules\n\nAlways use pnpm.\n").unwrap();
+
+        run_copilot_global_at(temp.path(), InitContext::default()).unwrap();
+
+        let content = fs::read_to_string(&instructions).unwrap();
+        assert!(content.contains("Always use pnpm."), "user content must be preserved");
+        assert!(content.contains(RTK_BLOCK_START));
+    }
+
+    #[test]
+    fn test_copilot_global_uninstall_preserves_user_instructions() {
+        let temp = TempDir::new().unwrap();
+        let instructions = temp.path().join(COPILOT_INSTRUCTIONS_FILE);
+        fs::write(&instructions, "# My rules\n\nAlways use pnpm.\n").unwrap();
+
+        run_copilot_global_at(temp.path(), InitContext::default()).unwrap();
+        uninstall_copilot_global_at(temp.path(), InitContext::default()).unwrap();
+
+        let content = fs::read_to_string(&instructions).unwrap();
+        assert!(content.contains("Always use pnpm."));
+        assert!(!content.contains(RTK_BLOCK_START), "RTK block removed");
     }
 
     #[test]
