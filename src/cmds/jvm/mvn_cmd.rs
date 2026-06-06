@@ -22,11 +22,15 @@ lazy_static! {
     static ref RUNNING: Regex = Regex::new(r"^\[INFO\] Running ").unwrap();
 
     /// Surefire/Failsafe per-class close line. Captures `Failures` and `Errors`.
-    /// Tolerates the optional `<<< FAILURE!` marker. Separator is `-` (Surefire 2.x)
-    /// or `--` (Surefire 3.x). Prefix INFO/ERROR/WARNING (3.x emits WARNING for
-    /// classes with only skipped tests).
+    /// Tolerates the optional `<<< FAILURE!` / `<<< ERROR!` marker (3.5.5 emits
+    /// `<<< FAILURE!` even for errors-only classes — see
+    /// `mvn_test_multifail_slice_raw.txt`; `ERROR!` accepted defensively for
+    /// other Surefire versions; failure detection is via the captured counts,
+    /// not the marker). Separator is `-` (Surefire 2.x) or `--` (Surefire 3.x).
+    /// Prefix INFO/ERROR/WARNING (3.x emits WARNING for classes with only
+    /// skipped tests).
     static ref CLOSE: Regex = Regex::new(
-        r"^\[(?:INFO|ERROR|WARNING)\] Tests run: \d+, Failures: (\d+), Errors: (\d+), Skipped: \d+, Time elapsed: [^ ]+ s(?:\s+<<<\s*FAILURE!)?\s+--?\s+in (.+)$"
+        r"^\[(?:INFO|ERROR|WARNING)\] Tests run: \d+, Failures: (\d+), Errors: (\d+), Skipped: \d+, Time elapsed: [^ ]+ s(?:\s+<<<\s*(?:FAILURE|ERROR)!)?\s+--?\s+in (.+)$"
     ).unwrap();
 
     /// Final BUILD footer.
@@ -117,6 +121,18 @@ fn is_framework_frame(trimmed: &str) -> bool {
         .any(|p| trimmed.starts_with(p))
 }
 
+/// `[ERROR] FQN.method -- Time elapsed: 0.030 s <<< FAILURE!` (or `<<< ERROR!`).
+/// Distinguished from CLOSE by call position: only consulted when
+/// `in_block == false` (CLOSE only occurs while a block is open). A
+/// CLOSE-shaped line outside a block would match too — acceptable: the
+/// disarm-on-take guard limits the effect to one stray line.
+/// Note: the `[ERROR]   Class.test:25 …` failures-summary entries (3-space
+/// indent, no `<<<` marker) do NOT match.
+fn is_per_test_subline(line: &str) -> bool {
+    line.starts_with("[ERROR] ")
+        && (line.contains("<<< FAILURE!") || line.contains("<<< ERROR!"))
+}
+
 // ── English-footer guard ────────────────────────────────────────────────────
 
 fn has_english_footer(stripped: &str) -> bool {
@@ -187,6 +203,13 @@ fn keep_outside_block(line: &str) -> bool {
 ///     emits **after** the close line, terminated by a blank line. Framework
 ///     frames (junit, jdk.proxy, java.base, etc.) are stripped from both the
 ///     buffered block and the trail; user-code frames are preserved.
+///   - multi-failure classes: Surefire 3.x emits one blank-separated detail
+///     block per failing test under a single CLOSE line. When a trail ends at
+///     a blank line, `trail_rearm` remembers the keep/drop decision so the
+///     next per-test subline re-enters the trail with the same decision.
+///     End-of-input with `trail_rearm` still `Some` is harmless (nothing
+///     pending in `out`); `finish()` / `flush_open_block_as_keep` need no
+///     special handling.
 struct SurefireBlock<'a> {
     block_lines: Vec<&'a str>,
     block_running: Option<&'a str>,
@@ -196,6 +219,12 @@ struct SurefireBlock<'a> {
     /// `<<< FAILURE!` subline, exception, user frames) without writing it to
     /// `out`. Used when the caller capped a failing block via `drop_failing`.
     drop_trail: bool,
+    /// Set when a trail ends at a blank line; holds the `drop_trail` value so
+    /// the next per-test subline of the same class re-enters the trail with
+    /// the same keep/drop decision (a capped class must drop **all** its
+    /// per-test blocks, not just the first). Cleared by any non-blank
+    /// non-subline line, by `RUNNING`, and by `commit_failing`/`drop_failing`.
+    trail_rearm: Option<bool>,
 }
 
 enum SurefireStep<'a> {
@@ -221,6 +250,7 @@ impl<'a> SurefireBlock<'a> {
             in_block: false,
             failure_trail: false,
             drop_trail: false,
+            trail_rearm: None,
         }
     }
 
@@ -237,6 +267,9 @@ impl<'a> SurefireBlock<'a> {
             self.block_running = Some(line);
             self.in_block = true;
             self.failure_trail = false;
+            // Load-bearing: a capped multi-failure class followed by a kept
+            // class must not re-arm into the new class's trail decision.
+            self.trail_rearm = None;
             return SurefireStep::Consumed;
         }
 
@@ -268,6 +301,9 @@ impl<'a> SurefireBlock<'a> {
                 if !self.drop_trail {
                     out.push('\n');
                 }
+                // Arm re-entry: a following per-test subline belongs to the
+                // same class and must inherit this trail's keep/drop decision.
+                self.trail_rearm = Some(self.drop_trail);
                 self.failure_trail = false;
                 self.drop_trail = false;
                 return SurefireStep::Consumed;
@@ -284,6 +320,25 @@ impl<'a> SurefireBlock<'a> {
             return SurefireStep::Consumed;
         }
 
+        if let Some(dropped) = self.trail_rearm {
+            if line.is_empty() {
+                // Tolerate extra blanks between per-test blocks: stay armed,
+                // let the blank fall through (outer keep-lists drop it).
+                return SurefireStep::Passthrough;
+            }
+            self.trail_rearm = None; // disarm unconditionally on non-blank (load-bearing)
+            if is_per_test_subline(line) {
+                self.failure_trail = true;
+                self.drop_trail = dropped;
+                if !dropped {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                return SurefireStep::Consumed;
+            }
+            // Non-subline: trail is over; already disarmed — fall through.
+        }
+
         SurefireStep::Passthrough
     }
 
@@ -294,6 +349,9 @@ impl<'a> SurefireBlock<'a> {
     fn drop_failing(&mut self) {
         self.failure_trail = true;
         self.drop_trail = true;
+        // Belt-and-suspenders: a CLOSE can only follow a RUNNING (which
+        // already cleared `trail_rearm`), but keep the invariant local too.
+        self.trail_rearm = None;
     }
 
     /// Commit a `FailingClose` to `out`: writes `running`, then `lines` (with
@@ -321,6 +379,8 @@ impl<'a> SurefireBlock<'a> {
         out.push_str(close);
         out.push('\n');
         self.failure_trail = true;
+        // Belt-and-suspenders: see `drop_failing`.
+        self.trail_rearm = None;
     }
 
     /// End-of-stream flush: if a block opened and never closed (truncated
@@ -722,12 +782,14 @@ pub fn filter_quiet(raw: &str) -> String {
         if CLOSE.is_match(line) {
             out.push_str(line);
             out.push('\n');
-            failure_trail = line.contains("<<< FAILURE!");
+            failure_trail =
+                line.contains("<<< FAILURE!") || line.contains("<<< ERROR!");
             continue;
         }
 
-        // Per-test failure subline: `[ERROR] FQN.method -- Time elapsed: … <<< FAILURE!`.
-        if line.starts_with("[ERROR] ") && line.contains("<<< FAILURE!") {
+        // Per-test failure subline: `[ERROR] FQN.method -- Time elapsed: … <<< FAILURE!`
+        // (or `<<< ERROR!` for thrown exceptions).
+        if is_per_test_subline(line) {
             out.push_str(line);
             out.push('\n');
             failure_trail = true;
@@ -1114,6 +1176,238 @@ mod tests {
             "framework frame stripped in trail; got:\n{}",
             o
         );
+    }
+
+    // ── Multi-failure class (trail re-arm) ──────────────────────────────────
+
+    /// Surefire 3.x emits one blank-separated detail block per failing test
+    /// under a single CLOSE line. All per-test exception messages must survive
+    /// (not just the first), framework frames must stay stripped throughout.
+    /// Real fixture: `CalcTest` (1 failure + 1 error) + `BoomTest` (errors-only).
+    #[test]
+    fn surefire_keeps_all_failures_in_multi_failure_class() {
+        let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
+        let o = filter_surefire(i);
+        assert!(
+            o.contains("AssertionFailedError: failOne: addition should equal five"),
+            "first failure message preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("IllegalStateException: failTwo: induced error"),
+            "second failure (ERROR! subline) message preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("at com.example.rtk.CalcTest.failOne(CalcTest.java:12)"),
+            "first user frame preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("at com.example.rtk.CalcTest.failTwo(CalcTest.java:17)"),
+            "second user frame preserved; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("at org.junit."),
+            "junit frames stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("at java.base/"),
+            "jdk frames stripped; got:\n{}",
+            o
+        );
+    }
+
+    /// Same multi-failure fixture through `filter_package` (drift guard —
+    /// the install/verify route shares `SurefireBlock` and must not diverge).
+    #[test]
+    fn package_keeps_all_failures_in_multi_failure_class() {
+        let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
+        let o = filter_package(i);
+        assert!(
+            o.contains("AssertionFailedError: failOne: addition should equal five"),
+            "first failure message preserved; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("IllegalStateException: failTwo: induced error"),
+            "second failure message preserved; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("at org.junit."),
+            "junit frames stripped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("at java.base/"),
+            "jdk frames stripped; got:\n{}",
+            o
+        );
+    }
+
+    /// A capped (dropped) multi-failure class must drop **all** its per-test
+    /// blocks — the re-arm inherits the drop decision — and the tail counts
+    /// classes, not failures. The existing `surefire_caps_failing_blocks_emits_tail`
+    /// only covers single-failure classes.
+    #[test]
+    fn surefire_drop_failing_drops_all_sublines_of_capped_class() {
+        let i = "[INFO] Scanning for projects...\n\
+                 [INFO] -----< x >-----\n\
+                 [INFO] Running x.FailA\n\
+                 [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.011 s <<< FAILURE! -- in x.FailA\n\
+                 [ERROR] x.FailA.one -- Time elapsed: 0.010 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boomA\n\
+                 \tat x.FailA.one(FailA.java:10)\n\
+                 \n\
+                 [INFO] Running x.MultiFail\n\
+                 [ERROR] Tests run: 2, Failures: 1, Errors: 1, Skipped: 0, Time elapsed: 0.051 s <<< FAILURE! -- in x.MultiFail\n\
+                 [ERROR] x.MultiFail.first -- Time elapsed: 0.020 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boomFirst\n\
+                 \tat x.MultiFail.first(MultiFail.java:20)\n\
+                 \n\
+                 [ERROR] x.MultiFail.second -- Time elapsed: 0.030 s <<< ERROR!\n\
+                 java.lang.IllegalStateException: boomSecond\n\
+                 \tat x.MultiFail.second(MultiFail.java:30)\n\
+                 \n\
+                 [INFO] BUILD FAILURE\n";
+        let o = filter_surefire_with_cap(i, 1);
+
+        assert!(o.contains("boomA"), "first class kept; got:\n{}", o);
+        assert!(
+            !o.contains("Running x.MultiFail") && !o.contains("boomFirst"),
+            "capped class first block dropped; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("x.MultiFail.second") && !o.contains("boomSecond"),
+            "capped class second per-test block dropped (re-arm inherits drop); got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("... +1 more failing test classes"),
+            "tail counts one class, not one per failure; got:\n{}",
+            o
+        );
+    }
+
+    /// A non-subline line (`[INFO] Results:`) immediately after a trail blank
+    /// must disarm the re-arm and be kept normally by the outside-block list.
+    #[test]
+    fn surefire_rearm_disarms_at_results_boundary() {
+        let i = "[INFO] -----< x >-----\n\
+                 [INFO] Running x.MultiFail\n\
+                 [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.051 s <<< FAILURE! -- in x.MultiFail\n\
+                 [ERROR] x.MultiFail.first -- Time elapsed: 0.020 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boomFirst\n\
+                 \n\
+                 [ERROR] x.MultiFail.second -- Time elapsed: 0.030 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boomSecond\n\
+                 \n\
+                 [INFO] Results:\n\
+                 [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0\n\
+                 [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        assert!(o.contains("boomSecond"), "second block kept; got:\n{}", o);
+        assert!(
+            o.contains("[INFO] Results:"),
+            "Results boundary disarms re-arm and is kept; got:\n{}",
+            o
+        );
+        assert!(
+            o.contains("[ERROR] Tests run: 2, Failures: 2"),
+            "aggregate kept; got:\n{}",
+            o
+        );
+    }
+
+    /// Double blank between per-test blocks: stay armed across the extra
+    /// blank, still re-enter the trail — and no spurious blank lines leak.
+    #[test]
+    fn surefire_tolerates_double_blank_between_failure_blocks() {
+        let i = "[INFO] -----< x >-----\n\
+                 [INFO] Running x.MultiFail\n\
+                 [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.051 s <<< FAILURE! -- in x.MultiFail\n\
+                 [ERROR] x.MultiFail.first -- Time elapsed: 0.020 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boomFirst\n\
+                 \n\
+                 \n\
+                 [ERROR] x.MultiFail.second -- Time elapsed: 0.030 s <<< FAILURE!\n\
+                 org.opentest4j.AssertionFailedError: boomSecond\n\
+                 \n\
+                 [INFO] BUILD FAILURE\n";
+        let o = filter_surefire(i);
+        assert!(o.contains("boomFirst"), "first block kept; got:\n{}", o);
+        assert!(
+            o.contains("boomSecond"),
+            "second block re-enters trail across double blank; got:\n{}",
+            o
+        );
+        assert!(
+            !o.contains("\n\n\n"),
+            "no spurious blank lines leak; got:\n{:?}",
+            o
+        );
+    }
+
+    /// Byte-exact pin of the single-failure path: the re-arm machinery must
+    /// not change output for single-failure fixtures (no extra blank lines,
+    /// no reordering). Literal captured from `filter_surefire` at the commit
+    /// preceding the trail re-arm change.
+    #[test]
+    fn surefire_single_failure_output_unchanged() {
+        let i = include_str!("../../../tests/fixtures/mvn_test_fail_slice_raw.txt");
+        let o = filter_surefire(i);
+        let expected = "[INFO] Scanning for projects...\n\
+                        [INFO] ----------------------< commons-cli:commons-cli >-----------------------\n\
+                        [INFO] Building Apache Commons CLI 1.11.1-SNAPSHOT\n\
+                        [INFO] Running org.apache.commons.cli.RtkInducedFailTest\n\
+                        [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.033 s <<< FAILURE! -- in org.apache.commons.cli.RtkInducedFailTest\n\
+                        [ERROR] org.apache.commons.cli.RtkInducedFailTest.rtkInducedFailure -- Time elapsed: 0.025 s <<< FAILURE!\n\
+                        org.opentest4j.AssertionFailedError: expected: <expected> but was: <actual>\n\
+                        \tat org.apache.commons.cli.RtkInducedFailTest.rtkInducedFailure(RtkInducedFailTest.java:25)\n\
+                        \n\
+                        [INFO] Results:\n\
+                        [ERROR] Failures:\n\
+                        [ERROR]   RtkInducedFailTest.rtkInducedFailure:25 expected: <expected> but was: <actual>\n\
+                        [ERROR] Tests run: 978, Failures: 1, Errors: 0, Skipped: 61\n\
+                        [INFO] BUILD FAILURE\n\
+                        [INFO] Total time:  01:05 min\n\
+                        [INFO] Finished at: 2026-05-21T14:57:09Z\n\
+                        [ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.5:test (default-test) on project commons-cli: There are test failures.\n";
+        assert_eq!(o, expected, "single-failure output must be byte-identical");
+    }
+
+    /// Savings on the multifail slice. Threshold is low by design: the slice
+    /// is nearly all kept failure signal (two failing classes, three per-test
+    /// detail blocks), so the droppable share is small — measured 19.9% at
+    /// commit time (precedent: reactor-fail pins ≥30% with a "short fixture"
+    /// note).
+    #[test]
+    fn savings_mvn_test_multifail_slice() {
+        let i = include_str!("../../../tests/fixtures/mvn_test_multifail_slice_raw.txt");
+        let o = filter_surefire(i);
+        let savings = 100.0 - (count_tokens(&o) as f64 / count_tokens(i) as f64 * 100.0);
+        assert!(
+            savings >= 15.0,
+            "multifail slice ≥15% savings (dense failure-signal fixture), got {:.1}%",
+            savings
+        );
+    }
+
+    /// CLOSE regex accepts a `<<< ERROR!` marker (defensive — Surefire 3.5.5
+    /// emits `<<< FAILURE!` even for errors-only classes, per the multifail
+    /// fixture capture; other versions may emit `ERROR!`).
+    #[test]
+    fn close_line_matches_error_marker() {
+        let line = "[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 0.006 s <<< ERROR! -- in com.example.rtk.BoomTest";
+        let caps = CLOSE
+            .captures(line)
+            .expect("CLOSE must match an ERROR!-marked close line");
+        assert_eq!(caps.get(1).expect("failures group").as_str(), "0");
+        assert_eq!(caps.get(2).expect("errors group").as_str(), "1");
     }
 
     /// `mvn test` whose compile step fails before Surefire runs must still
@@ -1730,3 +2024,4 @@ mod tests {
         );
     }
 }
+
